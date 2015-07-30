@@ -26,12 +26,16 @@ import argparse
 import subprocess
 import xml.etree.ElementTree
 from io import BytesIO
+from collections import defaultdict
 import tarfile
 import tempfile
 import docker
 import json
 import glob
+import hashlib
 import base64
+from zipfile import ZipFile
+import tempfile
 
 
 __version__ = '0.1.0'
@@ -277,6 +281,8 @@ class CppCheck(object):
 
     def check(self, project):
         cmd  = ["cppcheck"]
+        # do not let CppCheck complain when it is to stupid to find systems includes
+        cmd += ["--suppress=missingIncludeSystem"]
         cmd += ["-I{include}".format(include=include) for include in project.include]
         cmd += ["--std=c99", "--enable=all", "--xml-version=2"]
         cmd += project.file_list
@@ -288,6 +294,17 @@ class CppCheck(object):
 
 
 class CunitParser(object):
+    """
+    Parses the output of a CUnit test run and returns messages containing the
+    not successfully completed tests. The messages can be appended onto a
+    Report object together with the results from CppCheck and Compiler.
+
+    Furthermore, a dictionary with all tests from all suites that have been run
+    is available as the attribute "list_of_tests".
+    """
+    def __init__(self):
+        self.list_of_tests = defaultdict(dict)
+
     def parse(self, data):
         messages = []
         tree = xml.etree.ElementTree.fromstring(data)
@@ -314,12 +331,27 @@ class CunitParser(object):
                     t_file = t_failure.find('FILE_NAME').text
                     t_line = t_failure.find('LINE_NUMBER').text
                     t_cond = t_failure.find('CONDITION').text
-                    messages.append(Message(_type="error", _file=t_file, line=t_line, desc="{suite} - {test} - Condition: {cond}".format(suite=s_name, test=t_name, cond=t_cond)))
+                    messages.append(Message(_type="error", _file=t_file, line=t_line,
+                                            desc="{suite} - {test} - Condition: {cond}".format(suite=s_name, test=t_name, cond=t_cond)))
+                    self.add_test_result(s_name, t_name, False)
                 elif t_success is not None:
                     t_name = t_success.find('TEST_NAME').text
+                    self.add_test_result(s_name, t_name, True)
                 else:
                     assert(0)
         return messages
+
+    def add_test_result(self, suite_name, test_name, success=False):
+        """
+        Adds a single unit test result to the list of all tests in all suites
+        that have been run. After parsing of the data is complete that list
+        contains all results.
+
+        :param suite_name: name of test suite for which to add result
+        :param test_name: name of unit test for which to add result
+        :param success: whether the unit test in test suite has been successful
+        """
+        self.list_of_tests[suite_name][test_name] = success
 
 
 class CunitChecker(object):
@@ -330,27 +362,31 @@ class CunitChecker(object):
 
     def run(self, project):
         img = "autotest/" + project.target
-
+        # check whether target file exists (has been compiled correctly)
+        if not os.path.exists(os.path.join(project.tempdir, project.target)):
+            raise FileNotFoundError("Error: Executable file has not been created!")
         dockerfile = """FROM scratch
                         COPY {target} /
                         CMD ["/{target}"]
                      """
-
+        # build Dockerfile and Docker image
         # TODO: this should be possible in-memory
         with open(os.path.join(project.tempdir, "Dockerfile"), "w") as fd:
             fd.write(dockerfile.format(target=project.target))
-
         build_out = self.client.build(path=project.tempdir, tag=img, rm=True, stream=False)
         [_ for _ in build_out]
 
+        # create container and start it (start unit tests, see Dockerfile)
         # TODO: check if image was created
         cont = self.client.create_container(image=img)
         self.client.start(container=cont)
-
         #out = self.client.attach(container=cont, logs=True)
         #print(out.decode('utf-8'))
-
-        self.client.wait(container=cont)
+        ret_val = self.client.wait(container=cont)
+        # catch problem when unit test executable returns with error code
+        if ret_val != 0:
+            print('Error code returned: {}'.format(ret_val))
+            return ReportPart("cunit", ret_val, [])
 
         try:
             temp = self.client.copy(container=cont, resource="/CUnitAutomated-Results.xml")
@@ -359,14 +395,10 @@ class CunitChecker(object):
             if 'Could not find the file' in e.explanation.decode('utf-8'):
                 print('Could not extract cunit results. Maybe source does not contain test?!')
             return ReportPart("cunit", -1, [])
-        buffer = BytesIO()
-        buffer.write(temp.data)
-        buffer.seek(0)
-        tar = tarfile.open(fileobj=buffer, mode='r')
-        fd = tar.extractfile('CUnitAutomated-Results.xml')
-        data = fd.read()
-        fd.close()
-        tar.close()
+        buffer = BytesIO(temp.read())
+        with tarfile.open(fileobj=buffer, mode='r') as tar:
+            with tar.extractfile('CUnitAutomated-Results.xml') as fd:
+                data = fd.read()
 
         self.client.stop(container=cont)
         self.client.remove_container(container=cont)
@@ -392,6 +424,7 @@ class Project(object):
 				        <Option type="1" />
 				        <Option compiler="gcc" />
 				        <Compiler>
+                            <Add option="-Wall" />
 					        <Add option="-g" />
                             <Add option="-std=c99" />
                             {include_dirs}
@@ -412,6 +445,22 @@ class Project(object):
         </CodeBlocks_project_file>
         <!--Watermark user="dummy" TODO: sadly, codeblocks removes this... -->
     """
+    cb_layout_template = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+        <CodeBlocks_layout_file>
+        	<ActiveTarget name="Debug" />
+        	<File name="description.md" open="1" top="1" tabpos="1" split="0" active="1" splitpos="0" zoom_1="0" zoom_2="0">
+        		<Cursor>
+        			<Cursor1 position="0" topLine="0" />
+        		</Cursor>
+        	</File>
+        	<File name="solution.c" open="1" top="0" tabpos="2" split="0" active="1" splitpos="0" zoom_1="0" zoom_2="0">
+        		<Cursor>
+        			<Cursor1 position="0" topLine="0" />
+        		</Cursor>
+        	</File>
+        </CodeBlocks_layout_file>
+    """
     cb_unit_template = """<Unit filename="{filename}"><Option compilerVar="CC" /></Unit>"""
     cb_unit_h_template = """<Unit filename="{filename}" />"""
 
@@ -420,15 +469,17 @@ class Project(object):
             libs = []
         if includes is None:
             includes = []
-        self.target    = target
-        self.file_list = file_list
-        self.libs      = libs
-        self.include   = includes
-        self.tempdir   = None
+        self.project_name = target
+        self.file_list    = file_list
+        self.libs         = libs
+        self.include      = includes
+        self.tempdir      = None
 
-        # Workaround for Docker not handling spaces well. Also upper case characters are a no go!
-        # https://github.com/docker/docker/issues/2105
-        self.target = base64.b64encode(self.target.encode('utf-8')).decode('utf-8').lower()
+        # Workaround for Docker not handling spaces well. Also upper case
+        # characters are a no go! Equal signs (used as padding in Base64) have
+        # to be stripped from the because they are not valid in docker repo
+        # name! (See: https://github.com/docker/docker/issues/2105)
+        self.target = base64.b64encode(self.project_name.encode("utf-8")).decode("utf-8").lower().replace("=", "")
 
         for f in self.file_list:
             if not os.path.isfile(f):
@@ -437,38 +488,62 @@ class Project(object):
         # TODO: test if libs are installed?!
 
 
-    def create_cb_project(self):
+    def create_cb_project(self, file_name="project.zip"):
         """
-        Create a CodeBlocks project file for this project. The XML file contains
-        links to all source and header files and sets all necessary compiler
-        options. Furthermore all include directories are added as search
-        directories for the compiler.
+        Create a CodeBlocks project inside a ZIP file. A XML project file
+        contains links to all source and header files and sets all necessary
+        compiler options. Furthermore all include directories are added as
+        search directories for the compiler.
 
-        :returns: name of new CodeBlocks project file, if no error occured
+        :param file_name: name for ZIP file containing CodeBlocks project
+        :returns: name of ZIP file containing CodeBlocks project
         """
-        file_name = "temp.cbp"
         unit_str = ""
         include_dirs = ""
-        for f in self.file_list:
-            unit_str += self.cb_unit_template.format(filename=f)
-        for d in self.include:
-            # set path to include files for compiler
-            include_dirs += """<Add directory="{dir}" />""".format(dir=d)
-            # add all header in include directories in project
-            for f in glob.glob(d + "/*.h"):
-                unit_str += self.cb_unit_h_template.format(filename=f)
-        with open(file_name, "w") as fd:
-            fd.write(self.cb_project_template.format(title=self.target, units=unit_str,
-                                                     include_dirs=include_dirs))
+        with ZipFile(file_name, "w") as project_zip:
+            already_packed_files = []
+            # include all code files
+            for f in self.file_list:
+                only_file_name = os.path.basename(f)
+                project_zip.write(f, only_file_name)
+                unit_str += self.cb_unit_template.format(filename=only_file_name)
+                already_packed_files.append(f)
+            # include all header from all include directories
+            for d in self.include:
+                # set path to include files for compiler
+                #include_dirs += """<Add directory="{dir}" />""".format(dir=d)
+                # add all header in include directories in project
+                for f in glob.glob(d + "/*.h"):
+                    if f not in already_packed_files:
+                        only_file_name = os.path.basename(f)
+                        project_zip.write(f, only_file_name)
+                        unit_str += self.cb_unit_h_template.format(filename=only_file_name)
+                        already_packed_files.append(f)
+            # include description file
+            task_directory = os.path.dirname(os.path.dirname(self.file_list[0]))
+            description_file_name = "description.md"
+            description_file = os.path.join(task_directory, description_file_name)
+            unit_str += self.cb_unit_h_template.format(filename=description_file_name)
+            project_zip.write(description_file, description_file_name)
+            # include project file
+            with tempfile.NamedTemporaryFile() as buffer:
+                buffer.write(self.cb_project_template.format(title=self.project_name, units=unit_str,
+                                                             include_dirs=include_dirs).encode("utf-8"))
+                buffer.flush()
+                project_zip.write(buffer.name, "{}.cbp".format(self.project_name))
+            # include layout file
+            with tempfile.NamedTemporaryFile() as buffer:
+                buffer.write(self.cb_layout_template.encode("utf-8"))
+                buffer.flush()
+                project_zip.write(buffer.name, "{}.layout".format(self.project_name))
         return file_name
-
 
 
 class Task(object):
     """
-        Represents one Task. Contains all Informations, to create 'packs' of 
+        Represents one Task. Contains all Informations, to create 'packs' of
         files to check, compile or distribute.
-        
+
         :ivar name          Name of the task.
         :ivar desc          Path to description file.
         :ivar scr_dir       Base dir for all files.
@@ -490,38 +565,59 @@ class Task(object):
         self.files_main    = data["files_main"]
         self.files_test    = data["files_test"]
         self.files_student = data["files_student"]
-    
+
     def get_main_project(self, solution):
         file_list = []
         file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files]
         file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_main]
-        # TODO: include files from actual solution
-        file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_student]
-
+        # add all files of given solution or files that have been defines in config file
+        if solution:
+            file_list += solution.solution_file_list
+        else:
+            file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_student]
+        # add all include directories
         include_list = []
         include_list += [os.path.join(self.path, self.src_dir)]
         # TODO: add task includes
         return Project(self.name, file_list, self.libs, include_list)
-        
+
     def get_test_project(self, solution):
         file_list = []
         file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files]
         file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_test]
-        # TODO: include files from actual solution
-        file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_student]
-        
+        # add all files of given solution or files that have been defines in config file
+        if solution:
+            file_list += solution.solution_file_list
+        else:
+            file_list += [os.path.join(self.path, self.src_dir, f) for f in self.files_student]
+        # add all include directories
         include_list = []
         include_list += [os.path.join(self.path, self.src_dir)]
         # TODO: add task includes
         return Project(self.name, file_list, self.libs, include_list)
-        
 
 
-def Solution(object):
-    def __init__(self, task, path):
+
+class Solution(object):
+    """
+    Provides a data object containing all information about a possible solution
+    for a given task. The source files given as parameter will be compiled with
+    all source files of the task itself.
+    """
+    def __init__(self, task, solution_file_list=None):
         self.task = task
-        self.path = path
+        if solution_file_list:
+            self.solution_file_list = solution_file_list
+        else:
+            self.solution_file_list = []
 
+    def get_solution_from_filesystem(self, username):
+        """
+        Allows the user to automatically collect a solution from filesystem by
+        a given task (see __init__()) and a given user name. Base directory for
+        the search is the current working directory???
+        """
+        pass
 
 
 class ConCoCt(object):
@@ -569,14 +665,36 @@ class ConCoCt(object):
         r = Report()
         _r = CppCheck().check(project)
         r.add_part(_r)
-        _r = CompilerGcc().compile(project)
-        r.add_part(_r)
-        # TODO: run cunit only, if compile successful
-        _r = CunitChecker().run(project)
-        r.add_part(_r)
+        if _r.returncode == 0:
+            _r = CompilerGcc().compile(project)
+            r.add_part(_r)
+        else:
+            print("Error: Could not run compiler because CppCheck returned error code.")
+        if _r.returncode == 0:
+            checker = CunitChecker()
+            _r = checker.run(project)
+            self.print_unit_test_results(checker.parser.list_of_tests)
+            r.add_part(_r)
+        else:
+            print("Error: Could not run unit tests because Compiler returned error code.")
 
         project.tempdir = None
         return r
+
+    def print_unit_test_results(self, testresults):
+        """
+        Prints test results to console if tests have been successfully executed.
+
+        :param testresults: dictionary containing the results for all test
+                            suites and their unit tests
+        """
+        if testresults:
+            print("=====")
+            for suite in sorted(testresults):
+                print("Suite: {}".format(suite))
+                for test in sorted(testresults[suite]):
+                    print("{:30s} - {}".format(test, 'success' if testresults[suite][test] else 'failure'))
+            print("=====")
 
 
 def parse_args():
@@ -585,33 +703,34 @@ def parse_args():
     cmd_options = parser.parse_args()
 
 
+def find_all_tasks(tasks_path="tasks"):
+    tasks = []
+    for d in os.listdir(tasks_path):
+        try:
+            t = Task(os.path.join(tasks_path, d))
+            if t is not None:
+                tasks.append(t)
+        except FileNotFoundError:
+            pass
+    return tasks
+
+
 if __name__ == '__main__':
     parse_args()
-
     try:
         w = ConCoCt()
     except FileNotFoundError as e:
         sys.exit(e)
 
-    tasks = []
-    for d in os.listdir("tasks"):
-        try:
-            t = Task(os.path.join("tasks", d))
-            if t is not None:
-                tasks.append(t)
-        except FileNotFoundError:
-            pass
+    t = Task(os.path.join("tasks", "greaterZero"))
+    s1 = Solution(t, ('/home/christian/Programmierung/python/UpLoad2/libconcoct/solutions/greaterZero/user1/solution.c', ))
+    s2 = Solution(t, ('/home/christian/Programmierung/python/UpLoad2/libconcoct/solutions/greaterZero/user2/solution.c', ))
 
-    # TODO: use solution instead of None
-    p = tasks[0].get_test_project(None)
-    r = w.check_project(p)
-    print(r)
-
-
-    #p = Project("task1", ["task1/main.c", "task1/group1/lib.c"], libs=["m"], includes=["task1"])
-    #p.create_cb_project()
+    # create test project and unit test it
+    #p = t.get_test_project(s2)
     #r = w.check_project(p)
     #print(r)
 
-
-
+    # create CodeBlocks project
+    p = t.get_main_project(None)
+    p.create_cb_project()
