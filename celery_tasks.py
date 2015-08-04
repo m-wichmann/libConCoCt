@@ -14,18 +14,20 @@ Start this worker in background with:
 
 Stop all workers with:
     ps auxww | grep 'celery worker' | awk '{print $2}' | xargs kill -9
+
+Authors: Christian Wichmann
 """
 
 
 import sys
 from celery import Celery
-from libConCoCt import Task, Solution, ConCoCt
+from libConCoct.concoct import Task, Solution, ConCoCt
 
 
 # CELERY SETTINGS
 BROKER_URL = 'amqp://'
 BACKEND = 'amqp'
-CELERY_ACCEPT_CONTENT = ['pickle', 'json']
+CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 
@@ -59,4 +61,4 @@ def build_and_check_task_with_solution(task_store_path, solution_file_list):
         sys.exit(e)
     p = t.get_test_project(s)
     r = w.check_project(p)
-    return r#.to_json()
+    return r.to_json()

@@ -1,5 +1,5 @@
 {
-    "name": "Schaltjahr",
+    "name": "FizzBuzz",
     "desc": "description.md",
     "libs": [],
     "src_dir": "src",

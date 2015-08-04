@@ -1,6 +1,6 @@
 #include "solution.h"
 
-int leapyear(int year)
+void fizzbuzz(int number, char* string)
 {
     
     /***** Enter solution here! *****/

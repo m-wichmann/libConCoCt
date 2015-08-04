@@ -10,21 +10,26 @@ worker to finish.
 
 Start this example task:
     ./celery_run.py
+
+Authors: Christian Wichmann
 """
 
 import celery_tasks
 import time
 import os
-from libConCoCt import Task, Solution
 
-# Available tasks: leapyear greaterZero
-task_directory = os.path.join('tasks', 'greaterZero')
-solution_file = (os.path.join('solutions', 'greaterZero', 'user2', 'solution.c'), )
-building = celery_tasks.build_and_check_task_with_solution.delay(task_directory,
-                                                                 solution_file)
 
-while not building.ready():
-    print('Waiting...')
-    time.sleep(0.2)
+def build_example():
+    # Available tasks: leapyear greaterZero, fizzbuzz
+    task_directory = os.path.join('tasks', 'fizzbuzz')
+    solution_file = (os.path.join('solutions', 'fizzbuzz', 'user1', 'solution.c'), )
+    building = celery_tasks.build_and_check_task_with_solution.delay(task_directory,
+                                                                     solution_file)
+    while not building.ready():
+        print('Waiting...')
+        time.sleep(0.2)
+    print(building.get())
 
-print(building.get())
+
+if __name__ == '__main__':
+    build_example()
